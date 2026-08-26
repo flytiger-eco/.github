@@ -1,0 +1,47 @@
+name: Organization PR Precheck
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  check-commit-emails:
+    name: Check commit author emails
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch PR commits and check author emails
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMITS_URL: ${{ github.event.pull_request.commits_url }}
+        run: |
+          echo "::group::Fetching PR commits"
+          COMMITS_JSON=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$COMMITS_URL?per_page=100")
+          echo "::endgroup::"
+
+          FAILED=0
+          FAILED_COMMITS=""
+
+          while IFS= read -r line; do
+            SHA=$(echo "$line" | cut -d'|' -f1)
+            EMAIL=$(echo "$line" | cut -d'|' -f2)
+            MESSAGE=$(echo "$line" | cut -d'|' -f3)
+
+            if echo "$EMAIL" | grep -iq "alibaba"; then
+              FAILED=1
+              FAILED_COMMITS="${FAILED_COMMITS}\n  - Commit ${SHA:0:7} (${EMAIL}): ${MESSAGE}"
+            fi
+          done < <(echo "$COMMITS_JSON" | jq -r '.[] | "\(.sha)|\(.commit.author.email)|\(.commit.message | split("\n")[0])"')
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "::error::❌ PR contains commits with prohibited author email (contains 'alibaba'):"
+            echo -e "$FAILED_COMMITS"
+            echo ""
+            echo "Please update the commit author email before merging."
+            echo "You can use: git commit --amend --author='Name <email>' or git rebase with mailmap."
+            exit 1
+          else
+            echo "✅ All commit author emails passed the check."
+          fi
