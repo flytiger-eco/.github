@@ -2,10 +2,6 @@ name: Precheck (Callable)
 on:
   workflow_call:
 
-permissions:
-  contents: read
-  pull-requests: read
-
 jobs:
   precheck:
     name: PR content precheck
