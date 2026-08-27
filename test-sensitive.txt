@@ -1,0 +1,4 @@
+# Configuration file
+registry = reg.docker.alibaba-inc.com/ai-tmp/llm
+source = https://code.aone.alibaba-inc.com/project
+vendor = t-head semiconductor
