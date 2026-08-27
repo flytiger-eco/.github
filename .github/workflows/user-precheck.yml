@@ -150,3 +150,21 @@ jobs:
           else
             echo "✅ All checks passed. No prohibited keywords found in emails, messages, or code."
           fi
+
+  # ═══════════════════════════════════════════════════
+  # Secret scanning: fail on verified/unknown leaked credentials
+  # ═══════════════════════════════════════════════════
+  secret-scan:
+    name: Secret Scan (TruffleHog)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: TruffleHog OSS secret scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --results=verified,unknown
