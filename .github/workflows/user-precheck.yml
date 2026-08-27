@@ -67,10 +67,10 @@ jobs:
             fi
 
             # Check commit message
-            if echo "$MESSAGE" | grep -iqE "$KEYWORDS"; then
-              MATCHED=$(echo "$MESSAGE" | grep -ioE "$KEYWORDS" | head -1)
-              add_violation "[message] Commit ${SHA:0:7} — commit message contains '${MATCHED}'"
-            fi
+            while IFS= read -r kw; do
+              [ -z "$kw" ] && continue
+              add_violation "[message] Commit ${SHA:0:7} — commit message contains '${kw}'"
+            done < <(echo "$MESSAGE" | grep -ioE "$KEYWORDS" | sort -uf)
           done <<< "$PARSED"
 
           # ═══════════════════════════════════════════════════
