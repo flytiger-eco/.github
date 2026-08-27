@@ -3,6 +3,7 @@ name: Organization PR Precheck
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_call:
 
 permissions:
   contents: read
@@ -21,6 +22,13 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+
+          # ─── Verify PR context is available ───
+          if [ -z "$COMMITS_URL" ] || [ -z "$PR_NUMBER" ]; then
+            echo "::error::This workflow requires a pull_request event context."
+            echo "::error::When using workflow_call, the caller must be triggered by pull_request."
+            exit 1
+          fi
 
           # ─── Keyword list (case-insensitive matching) ───
           KEYWORDS="alibaba-inc.com|t-head|aone"
