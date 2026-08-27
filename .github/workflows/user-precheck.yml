@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   check-commit-emails:
     name: Check commit author emails
@@ -20,10 +24,29 @@ jobs:
             "$COMMITS_URL?per_page=100")
           echo "::endgroup::"
 
+          # Validate the API response is a legitimate JSON array before parsing.
+          # This prevents silent pass-through when the API returns 403/error objects.
+          if ! echo "$COMMITS_JSON" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "::error::Failed to fetch PR commits. API response:"
+            echo "$COMMITS_JSON" | jq . 2>/dev/null || echo "$COMMITS_JSON"
+            exit 1
+          fi
+
+          # Parse commits into a variable first and check jq's exit code, so that a
+          # parse failure fails the workflow instead of being swallowed by the
+          # process substitution used in the while loop below.
+          PARSED=$(echo "$COMMITS_JSON" | jq -r '.[] | "\(.sha)|\(.commit.author.email)|\(.commit.message | split("\n")[0])"')
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to parse PR commits JSON."
+            echo "$COMMITS_JSON" | jq . 2>/dev/null || echo "$COMMITS_JSON"
+            exit 1
+          fi
+
           FAILED=0
           FAILED_COMMITS=""
 
           while IFS= read -r line; do
+            [ -z "$line" ] && continue
             SHA=$(echo "$line" | cut -d'|' -f1)
             EMAIL=$(echo "$line" | cut -d'|' -f2)
             MESSAGE=$(echo "$line" | cut -d'|' -f3)
@@ -32,7 +55,7 @@ jobs:
               FAILED=1
               FAILED_COMMITS="${FAILED_COMMITS}\n  - Commit ${SHA:0:7} (${EMAIL}): ${MESSAGE}"
             fi
-          done < <(echo "$COMMITS_JSON" | jq -r '.[] | "\(.sha)|\(.commit.author.email)|\(.commit.message | split("\n")[0])"')
+          done <<< "$PARSED"
 
           if [ "$FAILED" -eq 1 ]; then
             echo ""
