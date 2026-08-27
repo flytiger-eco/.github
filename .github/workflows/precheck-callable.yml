@@ -1,0 +1,98 @@
+name: Precheck (Callable)
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  precheck:
+    name: PR content precheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check commits and code diff for prohibited keywords
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMITS_URL: ${{ github.event.pull_request.commits_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          KEYWORDS="alibaba-inc.com|t-head|aone"
+          FAILED=0
+          REPORT=""
+          add_violation() {
+            FAILED=1
+            REPORT="${REPORT}\n  $1"
+          }
+          echo "::group::Fetching PR commits"
+          COMMITS_JSON=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$COMMITS_URL?per_page=100")
+          echo "::endgroup::"
+          if ! echo "$COMMITS_JSON" | jq -e 'type == "array"' > /dev/null 2>&1; then
+            echo "::error::Failed to fetch PR commits. API response:"
+            echo "$COMMITS_JSON" | jq . 2>/dev/null || echo "$COMMITS_JSON"
+            exit 1
+          fi
+          PARSED=$(echo "$COMMITS_JSON" | jq -r '.[] | "\(.sha)|\(.commit.author.email)|\(.commit.message)"')
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            SHA=$(echo "$line" | cut -d'|' -f1)
+            EMAIL=$(echo "$line" | cut -d'|' -f2)
+            MESSAGE=$(echo "$line" | cut -d'|' -f3-)
+            if echo "$EMAIL" | grep -iqE "$KEYWORDS"; then
+              MATCHED=$(echo "$EMAIL" | grep -ioE "$KEYWORDS" | head -1)
+              add_violation "[email] Commit ${SHA:0:7} — author email '${EMAIL}' contains '${MATCHED}'"
+            fi
+            if echo "$MESSAGE" | grep -iqE "$KEYWORDS"; then
+              MATCHED=$(echo "$MESSAGE" | grep -ioE "$KEYWORDS" | head -1)
+              add_violation "[message] Commit ${SHA:0:7} — commit message contains '${MATCHED}'"
+            fi
+          done <<< "$PARSED"
+          echo "::group::Fetching PR changed files"
+          PAGE=1
+          ALL_FILES_JSON="[]"
+          while true; do
+            FILES_PAGE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100&page=${PAGE}")
+            if ! echo "$FILES_PAGE" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              echo "::error::Failed to fetch PR files (page $PAGE)."
+              echo "$FILES_PAGE" | jq . 2>/dev/null || echo "$FILES_PAGE"
+              exit 1
+            fi
+            COUNT=$(echo "$FILES_PAGE" | jq 'length')
+            [ "$COUNT" -eq 0 ] && break
+            ALL_FILES_JSON=$(echo "$ALL_FILES_JSON $FILES_PAGE" | jq -s '.[0] + .[1]')
+            PAGE=$((PAGE + 1))
+            [ "$PAGE" -gt 10 ] && break
+          done
+          echo "::endgroup::"
+          TOTAL_FILES=$(echo "$ALL_FILES_JSON" | jq 'length')
+          echo "Checking $TOTAL_FILES changed files..."
+          for i in $(seq 0 $((TOTAL_FILES - 1))); do
+            FILENAME=$(echo "$ALL_FILES_JSON" | jq -r ".[$i].filename")
+            PATCH=$(echo "$ALL_FILES_JSON" | jq -r ".[$i].patch // empty")
+            [ -z "$PATCH" ] && continue
+            ADDED_LINES=$(echo "$PATCH" | grep -E '^\+[^+]' || true)
+            [ -z "$ADDED_LINES" ] && continue
+            while IFS= read -r diff_line; do
+              if echo "$diff_line" | grep -iqE "$KEYWORDS"; then
+                MATCHED=$(echo "$diff_line" | grep -ioE "$KEYWORDS" | head -1)
+                SNIPPET=$(echo "$diff_line" | cut -c2-80)
+                add_violation "[code] File '${FILENAME}' — contains '${MATCHED}': ${SNIPPET}"
+              fi
+            done <<< "$ADDED_LINES"
+          done
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "::error::❌ PR precheck failed — prohibited keywords detected:"
+            echo -e "$REPORT"
+            echo ""
+            echo "Please remove or replace the flagged content before merging."
+            exit 1
+          else
+            echo "✅ All checks passed."
+          fi
