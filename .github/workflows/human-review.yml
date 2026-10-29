@@ -40,10 +40,8 @@ jobs:
           MAX_WAIT=21600  # 6 hours
           ELAPSED=0
 
-          # A public repository lets any signed-in account approve a pull request, and such an
-          # approval must never be enough to release the downstream CI and hardware jobs.
-          PUSH_ACCESS='["OWNER", "MEMBER", "COLLABORATOR"]'
-          echo "ℹ️  Accepting approvals only from repository owners, org members and collaborators."
+          # GITHUB_TOKEN may see NONE for an organization member whose membership is private.
+          echo "Reviewers must hold push rights on this repository to satisfy the approval gate."
           echo ""
 
           while true; do
@@ -51,35 +49,37 @@ jobs:
               "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
             # COMMENTED reviews don't change a reviewer's verdict, matching GitHub's own approval logic.
-            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r --argjson trusted "$PUSH_ACCESS" '
-              [ .[]
-                | select(.user.type != "Bot")
-                | select((.author_association // "NONE") as $a | $trusted | index($a))
-                | select(.state != "COMMENTED" and .state != "PENDING")
-              ]
+            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq '
+              [ .[] | select(.user.type != "Bot" and .state != "COMMENTED" and .state != "PENDING") ]
               | group_by(.user.login)
               | map(sort_by(.submitted_at) | last)
               | [ .[] | select(.state == "APPROVED") ]
             ')
 
-            APPROVE_COUNT=$(echo "$APPROVED_HUMANS" | jq 'length')
+            APPROVE_COUNT=0
+            while IFS= read -r REVIEWER; do
+              if ! ACCESS=$(gh api "repos/${REPO}/collaborators/${REVIEWER}/permission" | jq -er '.permission'); then
+                echo "::error::Repository access lookup failed for ${REVIEWER}."
+                exit 1
+              fi
+              case "$ACCESS" in
+                write|admin)
+                  echo "   Accepted ${REVIEWER}'s approval (repository access: ${ACCESS})."
+                  APPROVE_COUNT=$((APPROVE_COUNT + 1))
+                  ;;
+                read|none)
+                  echo "   Skipped ${REVIEWER}'s approval: repository access is ${ACCESS}."
+                  ;;
+                *)
+                  echo "::error::Unrecognized repository access for ${REVIEWER}: ${ACCESS}"
+                  exit 1
+                  ;;
+              esac
+            done < <(echo "$APPROVED_HUMANS" | jq -r '.[].user.login')
 
             if [ "$APPROVE_COUNT" -ge 1 ]; then
-              echo ""
-              echo "✅ Human review approval detected! (${APPROVE_COUNT} approver(s))"
-              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) (\(.author_association)) approved at \(.submitted_at)"'
+              echo "Approval gate satisfied by ${APPROVE_COUNT} reviewer(s) with push rights."
               exit 0
-            fi
-
-            SKIPPED_COUNT=$(echo "$REVIEWS_JSON" | jq --argjson trusted "$PUSH_ACCESS" '
-              [ .[]
-                | select(.user.type != "Bot" and .state == "APPROVED")
-                | select((.author_association // "NONE") as $a | $trusted | index($a) | not)
-              ] | length
-            ')
-
-            if [ "$SKIPPED_COUNT" -ge 1 ]; then
-              echo "  ℹ️  Skipped ${SKIPPED_COUNT} approval(s) from account(s) without push rights."
             fi
 
             if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
