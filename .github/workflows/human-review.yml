@@ -40,13 +40,23 @@ jobs:
           MAX_WAIT=21600  # 6 hours
           ELAPSED=0
 
+          # A public repository lets any signed-in account approve a pull request, and such an
+          # approval must never be enough to release the downstream CI and hardware jobs.
+          PUSH_ACCESS='["OWNER", "MEMBER", "COLLABORATOR"]'
+          echo "ℹ️  Accepting approvals only from repository owners, org members and collaborators."
+          echo ""
+
           while true; do
             REVIEWS_JSON=$(gh api --paginate --slurp \
               "repos/${REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" | jq 'add // []')
 
             # COMMENTED reviews don't change a reviewer's verdict, matching GitHub's own approval logic.
-            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r '
-              [ .[] | select(.user.type != "Bot" and .state != "COMMENTED" and .state != "PENDING") ]
+            APPROVED_HUMANS=$(echo "$REVIEWS_JSON" | jq -r --argjson trusted "$PUSH_ACCESS" '
+              [ .[]
+                | select(.user.type != "Bot")
+                | select((.author_association // "NONE") as $a | $trusted | index($a))
+                | select(.state != "COMMENTED" and .state != "PENDING")
+              ]
               | group_by(.user.login)
               | map(sort_by(.submitted_at) | last)
               | [ .[] | select(.state == "APPROVED") ]
@@ -57,8 +67,19 @@ jobs:
             if [ "$APPROVE_COUNT" -ge 1 ]; then
               echo ""
               echo "✅ Human review approval detected! (${APPROVE_COUNT} approver(s))"
-              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) approved at \(.submitted_at)"'
+              echo "$APPROVED_HUMANS" | jq -r '.[] | "   ✓ \(.user.login) (\(.author_association)) approved at \(.submitted_at)"'
               exit 0
+            fi
+
+            SKIPPED_COUNT=$(echo "$REVIEWS_JSON" | jq --argjson trusted "$PUSH_ACCESS" '
+              [ .[]
+                | select(.user.type != "Bot" and .state == "APPROVED")
+                | select((.author_association // "NONE") as $a | $trusted | index($a) | not)
+              ] | length
+            ')
+
+            if [ "$SKIPPED_COUNT" -ge 1 ]; then
+              echo "  ℹ️  Skipped ${SKIPPED_COUNT} approval(s) from account(s) without push rights."
             fi
 
             if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
