@@ -164,3 +164,12 @@ jobs:
             esac
           done
           exit "$FAILED"
+
+  # Live scenario: call the gate exactly as a real caller does, on this pull request. Stubbed
+  # cases cover the decision logic; this one shows the gate holds the pipeline until an account
+  # with push rights approves. The wait window is the gate's own 360 minutes.
+  approval-gate:
+    name: Approval Gate (live)
+    needs: test
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/human-review.yml
