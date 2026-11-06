@@ -3,9 +3,8 @@ name: AI Code Review (Copilot Gate)
 on:
   workflow_call:
 
-permissions:
-  contents: read
-  pull-requests: read
+# Deliberately no permissions block: the token is inherited from the caller (it can never be
+# widened here), so the fallback request only works where the caller grants pull-requests: write.
 
 jobs:
   ai-code-review:
@@ -28,8 +27,12 @@ jobs:
           fi
 
           POLL_INTERVAL=20
-          MAX_WAIT=900  # 15 minutes
+          MAX_WAIT=1800  # 30 minutes
           ELAPSED=0
+          COPILOT_REVIEWER="copilot-pull-request-reviewer[bot]"
+          # Rulesets ask Copilot almost immediately after a PR opens; leave them this head start.
+          GRACE_SECONDS=60
+          FALLBACK_DONE=0
 
           echo "🤖 Waiting for Copilot code review on PR #${PR_NUMBER}..."
           echo ""
@@ -53,6 +56,30 @@ jobs:
               echo "   State: ${REVIEW_STATE}"
               echo "   Submitted at: ${REVIEW_TIME}"
               exit 0
+            fi
+
+            # requested_reviewers hides Copilot while its review runs; only the timeline shows earlier requests.
+            if [ "$FALLBACK_DONE" = 0 ]; then
+              if ! PR_INFO=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}"); then
+                FALLBACK_DONE=1
+                echo "::warning::PR #${PR_NUMBER} could not be read, so the gate will not ask Copilot itself."
+              elif [ $(( $(date +%s) - $(echo "$PR_INFO" | jq -r '.created_at | fromdateiso8601') )) -ge "$GRACE_SECONDS" ]; then
+                FALLBACK_DONE=1
+                if ! EVENTS_JSON=$(gh api --paginate --slurp "repos/${REPO}/issues/${PR_NUMBER}/timeline?per_page=100"); then
+                  echo "::warning::PR timeline is not readable, so the gate will not ask Copilot itself."
+                elif [ "$(echo "$EVENTS_JSON" | jq '[ add // [] | .[]
+                      | select(.event == "review_requested"
+                               and ((.requested_reviewer.login // "") | ascii_downcase | startswith("copilot"))) ]
+                      | length')" -eq 0 ]; then
+                  echo "  🔁 No Copilot request found on this PR, asking Copilot once."
+                  if gh api -X POST "repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers" \
+                      -f "reviewers[]=${COPILOT_REVIEWER}" > /dev/null; then
+                    echo "  ✅ Copilot has been asked to review."
+                  else
+                    echo "::warning::Asking Copilot failed. Grant pull-requests: write in the caller (fork PRs are always read-only) or request the review by hand."
+                  fi
+                fi
+              fi
             fi
 
             ELAPSED=$((ELAPSED + POLL_INTERVAL))

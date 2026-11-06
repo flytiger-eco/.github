@@ -22,6 +22,10 @@ jobs:
   test:
     name: Test Review Gates
     runs-on: ubuntu-latest
+    # pull-requests: write so the live check can really ask Copilot when a PR here lacks a request.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,6 +68,28 @@ jobs:
               reviewer=${reviewer%/permission}
               jq -c --arg login "$reviewer" '{permission: .[$login]}' "$GH_PERMISSIONS_FIXTURE"
               ;;
+            "api repos/${REPO}/pulls/${PR_NUMBER}")
+              printf '{"created_at":"%s"}\n' "${GH_PR_CREATED:-2026-01-01T00:00:00Z}"
+              ;;
+            "api --paginate --slurp repos/${REPO}/issues/${PR_NUMBER}/timeline?per_page=100")
+              if [ "${GH_TIMELINE_FAIL:-0}" = 1 ]; then
+                echo "gh: Resource not accessible by integration (HTTP 403)" >&2
+                exit 1
+              fi
+              if [ "${GH_COPILOT_ASKED:-1}" = 1 ]; then
+                echo '[[{"event":"review_requested","requested_reviewer":{"login":"Copilot"}}]]'
+              else
+                echo '[[{"event":"labeled"},{"event":"review_requested","requested_reviewer":{"login":"bob"}}]]'
+              fi
+              ;;
+            "api -X POST repos/${REPO}/pulls/${PR_NUMBER}/requested_reviewers -f reviewers[]=copilot-pull-request-reviewer[bot]")
+              echo asked >> "$GH_ASK_LOG"
+              if [ "${GH_ASK_FAIL:-0}" = 1 ]; then
+                echo "gh: Resource not accessible by integration (HTTP 403)" >&2
+                exit 1
+              fi
+              echo '{}'
+              ;;
             *)
               echo "unsupported gh invocation: $*" >&2
               exit 2
@@ -78,6 +104,7 @@ jobs:
           FAILED=0
           APPROVED=0 WAITING=99 ERROR=1
           COPILOT="copilot-pull-request-reviewer[bot]"
+          ASK_LOG="$RUNNER_TEMP/copilot-asks.log"
 
           # Review specs use login:type:state[:association[:permission]]; defaults are NONE/write.
           fixture() {
@@ -96,14 +123,17 @@ jobs:
             for i in $(seq 1 "$1"); do echo "filler$i:User:COMMENTED"; done
           }
 
-          # Usage: run_case <gate> <name> <expected exit> [specs...]; PR / GH_FAIL may be overridden per call.
+          # Usage: run_case <gate> <name> <expected exit> [specs...]; PR and the GH_* stub knobs may be set per call.
           run_case() {
             local gate=$1 name=$2 expected=$3 actual
             shift 3
             fixture "$@"
+            : > "$ASK_LOG"
             set +e
             PATH="$STUBS:$PATH" GH_FIXTURE="$RUNNER_TEMP/fixture.json" GH_FAIL="${GH_FAIL:-0}" \
               GH_PERMISSIONS_FIXTURE="$RUNNER_TEMP/permissions.json" GH_PERMISSION_FAIL="${GH_PERMISSION_FAIL:-0}" \
+              GH_PR_CREATED="${GH_PR_CREATED:-}" GH_TIMELINE_FAIL="${GH_TIMELINE_FAIL:-0}" \
+              GH_COPILOT_ASKED="${GH_COPILOT_ASKED:-1}" GH_ASK_FAIL="${GH_ASK_FAIL:-0}" GH_ASK_LOG="$ASK_LOG" \
               PR_NUMBER="${PR-42}" REPO=flytiger-eco/test bash "$gate" > "$RUNNER_TEMP/out.log" 2>&1
             actual=$?
             set -e
@@ -112,6 +142,19 @@ jobs:
             else
               echo "::error::✗ ${name}: expected exit ${expected}, got ${actual}"
               echo "::group::${name} output"; cat "$RUNNER_TEMP/out.log"; echo "::endgroup::"
+              FAILED=1
+            fi
+          }
+
+          # Usage: assert_asks <name> <count>; verifies how often the last case asked Copilot.
+          assert_asks() {
+            local asks
+            asks=$(wc -l < "$ASK_LOG" | tr -d ' ')
+            if [ "$asks" = "$2" ]; then
+              echo "✓ ${1}: asked Copilot ${asks} time(s)"
+            else
+              echo "::error::✗ ${1}: expected ${2} Copilot ask(s), saw ${asks}"
+              echo "::group::${1} output"; cat "$RUNNER_TEMP/out.log"; echo "::endgroup::"
               FAILED=1
             fi
           }
@@ -158,6 +201,19 @@ jobs:
           run_case $G "Copilot review on page 2" $APPROVED $(fillers 100) "$COPILOT:Bot:COMMENTED"
           run_case $G "human reviews only" $WAITING alice:User:APPROVED $(fillers 120)
           run_case $G "other bot ignored" $WAITING other-bot:Bot:COMMENTED
+          run_case $G "ruleset already asked Copilot" $WAITING
+          assert_asks "ruleset already asked Copilot" 0
+          GH_COPILOT_ASKED=0 run_case $G "no Copilot request anywhere" $WAITING bob:User:APPROVED
+          assert_asks "no Copilot request anywhere" 1
+          GH_COPILOT_ASKED=0 GH_PR_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            run_case $G "just-opened PR waits for the ruleset" $WAITING
+          assert_asks "just-opened PR waits for the ruleset" 0
+          GH_COPILOT_ASKED=0 GH_ASK_FAIL=1 run_case $G "rejected ask does not fail the gate" $WAITING
+          assert_asks "rejected ask does not fail the gate" 1
+          GH_COPILOT_ASKED=0 GH_TIMELINE_FAIL=1 run_case $G "no timeline access means no ask" $WAITING
+          assert_asks "no timeline access means no ask" 0
+          GH_COPILOT_ASKED=0 run_case $G "finished Copilot review needs no ask" $APPROVED "$COPILOT:Bot:COMMENTED"
+          assert_asks "finished Copilot review needs no ask" 0
           GH_FAIL=1 run_case $G "API failure" $ERROR
           PR="" run_case $G "missing PR context" $ERROR
 
@@ -178,6 +234,7 @@ jobs:
             name=$(basename "$gate" .sh)
             PATH="$RUNNER_TEMP/sleep-only:$PATH" bash "$gate" > "$RUNNER_TEMP/live.log" 2>&1
             code=$?
+            echo "::group::${name} output against the real API"; cat "$RUNNER_TEMP/live.log"; echo "::endgroup::"
             case "$code" in
               0) echo "✓ ${name}: passed against the real API (awaited review already present)" ;;
               99) echo "✓ ${name}: reached the polling wait against the real API" ;;
