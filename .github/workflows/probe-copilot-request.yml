@@ -1,0 +1,20 @@
+name: Probe Copilot request
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_ID: ${{ github.event.pull_request.node_id }}
+    steps:
+      - name: Request Copilot through GraphQL and print the outcome
+        run: |
+          gh api graphql -f id="$PR_ID" -f query='mutation($id: ID!) { requestCopilotCodeReview(input: {pullRequestId: $id}) { success failureReason actor { login } reviewRequest { id } } }' || true
+          gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/timeline?per_page=100" --jq '[.[] | select(.event == "review_requested") | {event, actor: .actor.login, reviewer: .requested_reviewer.login}]' || true
